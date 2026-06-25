@@ -1,0 +1,6 @@
+hcloud_token         = "your-hetzner-cloud-api-token"
+cloudflare_api_token = "your-cloudflare-api-token"
+cloudflare_zone_id   = "your-cloudflare-zone-id"
+domain               = "matchgen.ai"
+ssh_public_key       = "ssh-rsa AAAA... your-public-key"
+server_type          = "cx23"

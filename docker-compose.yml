@@ -1,0 +1,226 @@
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: matchgen-api
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://matchgen:${DB_PASSWORD}@db:5432/matchgen
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - ENVIRONMENT=production
+      - LOG_LEVEL=INFO
+      - WEB_CONCURRENCY=1
+      - AI_MODEL=${AI_MODEL:-phi4-mini}
+    ports:
+      - "8000:8000"
+    volumes:
+      - app-data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    networks:
+      - matchgen-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+        reservations:
+          memory: 128M
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: matchgen-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - app
+    networks:
+      - matchgen-network
+    deploy:
+      resources:
+        limits:
+          memory: 48M
+        reservations:
+          memory: 32M
+
+  db:
+    image: postgres:15-alpine
+    container_name: matchgen-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=matchgen
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=matchgen
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./backups:/backups
+    networks:
+      - matchgen-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U matchgen"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+        reservations:
+          memory: 256M
+    command: >
+      postgres
+      -c shared_buffers=64MB
+      -c effective_cache_size=128MB
+      -c maintenance_work_mem=32MB
+      -c work_mem=4MB
+      -c max_connections=30
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=50
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c fsync=off
+      -c synchronous_commit=off
+      -c full_page_writes=off
+      -c logging_collector=off
+
+  redis:
+    image: redis:7-alpine
+    container_name: matchgen-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 48mb
+      --maxmemory-policy allkeys-lru
+      --appendonly no
+      --save ""
+    volumes:
+      - redis-data:/data
+    networks:
+      - matchgen-network
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+        reservations:
+          memory: 48M
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: matchgen-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - matchgen-network
+    deploy:
+      resources:
+        limits:
+          memory: ${OLLAMA_MEMORY_LIMIT:-3G}
+        reservations:
+          memory: ${OLLAMA_MEMORY_RESERVATION:-2G}
+    entrypoint: >
+      sh -c "
+        ollama serve &
+        sleep 5
+        echo 'Pulling ${AI_MODEL:-phi4-mini}...'
+        ollama pull ${AI_MODEL:-phi4-mini}
+        echo 'Model ready!'
+        wait
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+      start_period: 180s
+
+  nginx:
+    image: nginx:alpine
+    container_name: matchgen-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - certbot-data:/etc/letsencrypt
+    depends_on:
+      - app
+      - frontend
+    networks:
+      - matchgen-network
+    deploy:
+      resources:
+        limits:
+          memory: 32M
+        reservations:
+          memory: 16M
+
+  certbot:
+    image: certbot/certbot
+    container_name: matchgen-certbot
+    restart: unless-stopped
+    volumes:
+      - certbot-data:/etc/letsencrypt
+      - ./nginx/ssl:/etc/nginx/ssl
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --quiet; sleep 12h; done'"
+    networks:
+      - matchgen-network
+
+  backup:
+    image: postgres:15-alpine
+    container_name: matchgen-backup
+    restart: unless-stopped
+    volumes:
+      - ./backups:/backups
+    environment:
+      - PGPASSWORD=${DB_PASSWORD}
+    entrypoint: >
+      sh -c "
+        while true; do
+          sleep 86400
+          pg_dump -h db -U matchgen matchgen > /backups/matchgen-$(date +%Y%m%d-%H%M%S).sql 2>/dev/null
+          find /backups -name '*.sql' -mtime +7 -delete
+        done
+      "
+    networks:
+      - matchgen-network
+    deploy:
+      resources:
+        limits:
+          memory: 48M
+        reservations:
+          memory: 32M
+
+networks:
+  matchgen-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  ollama-data:
+  app-data:
+  certbot-data:
